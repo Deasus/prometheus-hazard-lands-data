@@ -92,6 +92,11 @@ def _buffer_wgs84(pt, radius_km: float, g):
     if all(-180 <= x <= 180 for x, _ in unwrapped):
         return circle_wgs84  # didn't really wrap
     unwrapped_poly = Polygon(unwrapped)
+    # make_valid on the unwrapped ring — the coordinate shift can introduce a
+    # self-intersection in rare polar-buffer cases.
+    if not unwrapped_poly.is_valid:
+        from shapely.validation import make_valid
+        unwrapped_poly = make_valid(unwrapped_poly)
 
     parts = []
     # West replica (shift +360): the "west" half seen at high longitudes.

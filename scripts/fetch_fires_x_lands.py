@@ -97,14 +97,23 @@ def main() -> None:
     grouped: dict[str, list[dict]] = defaultdict(list)
     for feat in raw:
         p = feat.get("properties") or {}
-        key = (
-            p.get("poly_IRWINID")
-            or p.get("attr_UniqueFireIdentifier")
-            or p.get("poly_IncidentName")
-            or f"__anon_{id(feat)}"
-        )
+        # Composite key: IRWIN_ID / UniqueFireIdentifier are authoritative when
+        # present; name alone is NOT — two unrelated "Sunrise" fires in AK and
+        # MT would otherwise merge. Fold in state+county as a disambiguator when
+        # only the name is available.
+        irwin = p.get("poly_IRWINID") or p.get("attr_UniqueFireIdentifier")
+        if irwin:
+            key = irwin
+        else:
+            name = p.get("poly_IncidentName") or ""
+            state = p.get("attr_POOState") or ""
+            county = p.get("attr_POOCounty") or ""
+            if name:
+                key = f"{name}|{state}|{county}"
+            else:
+                key = f"__anon_{id(feat)}"
         grouped[key].append(feat)
-    print(f"  grouped into {len(grouped)} unique fires (dedup by IRWIN_ID)")
+    print(f"  grouped into {len(grouped)} unique fires (IRWIN_ID / name+state+county dedup)")
 
     items: list[dict] = []
     fragments: list[dict] = []

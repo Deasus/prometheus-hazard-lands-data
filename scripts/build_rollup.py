@@ -191,14 +191,21 @@ def main() -> None:
             + (" ..." if len(uncovered_codes) > 10 else "")
         )
 
-    # Freshness: any hazard file older than 30 min triggers a stale marker on
-    # this rollup (the pipeline itself might still be healthy; we're being
-    # honest about the feeds).
+    # Freshness + feed status: any hazard older than 30 min triggers a stale
+    # marker; any hazard whose status is not ok/empty is captured as
+    # feed_status so the exec view can see a partial failure instead of
+    # reading a silent zero as "all clear."
     from datetime import datetime, timezone
     stale_hazards = []
+    feed_status: dict[str, str] = {}
     for k, payload in hazards.items():
+        feed_status[k] = payload.get("status") or "unknown"
         ga = payload.get("generatedAt") or payload.get("generated")
         if not ga:
+            # Missing/errored feeds have no generatedAt — mark them stale so
+            # this failure mode isn't silent in the freshness signal.
+            if feed_status[k] not in ("ok", "empty"):
+                stale_hazards.append({"hazard": k, "reason": feed_status[k]})
             continue
         try:
             t = datetime.strptime(ga, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -208,11 +215,25 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             pass
 
+    # Any feed not "ok"/"empty" pushes overall status to "partial"; stale
+    # hazards push to "stale". Priority: partial > stale > ok.
+    any_partial = any(v not in ("ok", "empty") for v in feed_status.values())
+    if any_partial:
+        overall_status = "partial"
+    elif stale_hazards:
+        overall_status = "stale"
+    else:
+        overall_status = "ok"
+
+    # Single now_iso() call → generated and generatedAt cannot drift across
+    # a second boundary on a cold GHA runner.
+    stamp = now_iso()
     rollup = {
-        "generated": now_iso(),
-        "generatedAt": now_iso(),  # contract-facing alias
+        "generated": stamp,
+        "generatedAt": stamp,
         "version": "v1",
-        "status": "ok" if not stale_hazards else "stale",
+        "status": overall_status,
+        "feed_status": feed_status,
         "totals": {
             # Lower-bound label matches implementation semantics.
             "acres_at_risk_lower_bound": acres_at_risk_lb,

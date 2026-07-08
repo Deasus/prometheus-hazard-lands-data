@@ -74,7 +74,8 @@ def write_json(path: str, payload: dict) -> None:
 
 def write_geojson(path: str, fc: dict) -> None:
     fc.setdefault("type", "FeatureCollection")
-    fc.setdefault("generated", now_iso())
+    # Match the contract naming used by write_json — one stamp, one key.
+    fc.setdefault("generatedAt", now_iso())
     fc.setdefault("version", "v1")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(fc, f, ensure_ascii=False, separators=(",", ":"))
@@ -128,7 +129,11 @@ def load_nps_mask() -> tuple[list[dict], Any]:
     """
     g = load_geo_stack()
     epoch_15m = int(time.time()) // 900
-    url = MASK_URL if MASK_URL.startswith("file://") else f"{MASK_URL}?t={epoch_15m}"
+    if MASK_URL.startswith("file://"):
+        url = MASK_URL
+    else:
+        sep = "&" if "?" in MASK_URL else "?"
+        url = f"{MASK_URL}{sep}t={epoch_15m}"
     print(f"[{now_iso()}] Loading NPS mask from {url}")
     try:
         fc = get_json(url, timeout=90)
