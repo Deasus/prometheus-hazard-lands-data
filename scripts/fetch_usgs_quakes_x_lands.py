@@ -52,7 +52,16 @@ def _buffer_wgs84(pt, radius_km: float, g):
     We use a per-point azimuthal-equidistant projection centered on the epicenter —
     accurate for the local buffer regardless of latitude/hemisphere. shapely's
     native `.buffer()` on WGS84 would be in degrees, which we don't want.
+
+    Antimeridian safety: back-transform to WGS84 can yield vertices spanning
+    ±180° for buffers near the dateline (e.g. Aleutian M7 → 300km buffer).
+    Without care, shapely stitches a polygon that crosses the whole world and
+    spuriously intersects unrelated NPS units. Fix: walk polygon vertices with
+    an unwrap heuristic (any hop > 180° gets ±360-corrected), then split at
+    ±180° and translate the two halves back into the canonical (-180, 180] frame.
     """
+    from shapely.geometry import Polygon, box
+    from shapely.affinity import translate
     lon, lat = pt.x, pt.y
     pyproj = g["pyproj"]
     aeqd = pyproj.CRS.from_proj4(
@@ -62,7 +71,43 @@ def _buffer_wgs84(pt, radius_km: float, g):
     back = pyproj.Transformer.from_crs(aeqd, 4326, always_xy=True).transform
     pt_metric = g["transform"](fwd, pt)
     circle_metric = pt_metric.buffer(radius_km * 1000.0, resolution=64)
-    return g["transform"](back, circle_metric)
+    circle_wgs84 = g["transform"](back, circle_metric)
+
+    # Fast path: no antimeridian involvement.
+    minx, _, maxx, _ = circle_wgs84.bounds
+    if (maxx - minx) <= 180 and -180 <= minx and maxx <= 180:
+        return circle_wgs84
+
+    # Unwrap coords into a continuous longitude frame (may extend beyond ±180).
+    coords = list(circle_wgs84.exterior.coords)
+    prev = coords[0][0]
+    unwrapped = []
+    for x, y in coords:
+        while x - prev > 180:
+            x -= 360
+        while x - prev < -180:
+            x += 360
+        unwrapped.append((x, y))
+        prev = x
+    if all(-180 <= x <= 180 for x, _ in unwrapped):
+        return circle_wgs84  # didn't really wrap
+    unwrapped_poly = Polygon(unwrapped)
+
+    parts = []
+    # West replica (shift +360): the "west" half seen at high longitudes.
+    for xmin, xmax, shift in [(-540, -180, +360), (-180, 180, 0), (180, 540, -360)]:
+        clip = box(xmin, -90, xmax, 90)
+        piece = unwrapped_poly.intersection(clip)
+        if piece.is_empty:
+            continue
+        if shift:
+            piece = translate(piece, xoff=shift)
+        parts.append(piece)
+    if not parts:
+        return circle_wgs84
+    if len(parts) == 1:
+        return parts[0]
+    return g["unary_union"](parts)
 
 
 def main() -> None:

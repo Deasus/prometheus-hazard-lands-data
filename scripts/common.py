@@ -62,7 +62,10 @@ def fail(msg: str):
 
 
 def write_json(path: str, payload: dict) -> None:
-    payload.setdefault("generated", now_iso())
+    # PanelPayload contract uses `generatedAt` (camelCase). Do NOT alias to
+    # `generated` — a second field drifts subtly from the intended one on cold
+    # GHA runners and gives consumers two possible read paths.
+    payload.setdefault("generatedAt", now_iso())
     payload.setdefault("version", "v1")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
@@ -118,11 +121,17 @@ def load_nps_mask() -> tuple[list[dict], Any]:
 
     unit_records is a list of {props, geom} dicts. STRtree indexes the geoms for
     fast bbox pre-filter before doing the expensive intersection.
+
+    CDN cache-bust: raw.githubusercontent caches ~5min. Append a 15-min-quantized
+    epoch so runs within the same 15-min window share a cache entry (matches our
+    cron cadence) but each new run gets fresh data if the mask was just refreshed.
     """
     g = load_geo_stack()
-    print(f"[{now_iso()}] Loading NPS mask from {MASK_URL}")
+    epoch_15m = int(time.time()) // 900
+    url = MASK_URL if MASK_URL.startswith("file://") else f"{MASK_URL}?t={epoch_15m}"
+    print(f"[{now_iso()}] Loading NPS mask from {url}")
     try:
-        fc = get_json(MASK_URL, timeout=90)
+        fc = get_json(url, timeout=90)
     except Exception as e:  # noqa: BLE001
         fail(f"NPS mask fetch failed: {e}")
     feats = fc.get("features") or []

@@ -89,23 +89,51 @@ def main() -> None:
         fail(f"NIFC fetch failed: {e}")
     print(f"  {len(raw)} active fire perimeters")
 
+    # WFIGS commonly holds multiple polygons per fire during morphology updates
+    # (superseded + current; agency-owner splits). Group by IRWIN_ID (falls back
+    # to poly_IncidentName) and union polygons — keep the newest DateCurrent's
+    # properties.
+    from collections import defaultdict
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for feat in raw:
+        p = feat.get("properties") or {}
+        key = (
+            p.get("poly_IRWINID")
+            or p.get("attr_UniqueFireIdentifier")
+            or p.get("poly_IncidentName")
+            or f"__anon_{id(feat)}"
+        )
+        grouped[key].append(feat)
+    print(f"  grouped into {len(grouped)} unique fires (dedup by IRWIN_ID)")
+
     items: list[dict] = []
     fragments: list[dict] = []
     max_rank = 0
     total_acres = 0.0
     fires_on_nps = 0
 
-    for f in raw:
-        p = f.get("properties") or {}
-        geom_gj = f.get("geometry")
-        if not geom_gj:
+    for key, features in grouped.items():
+        # Pick newest by poly_DateCurrent for authoritative props; union all polys.
+        features.sort(key=lambda f: (f.get("properties") or {}).get("poly_DateCurrent") or 0, reverse=True)
+        newest = features[0]
+        p = newest.get("properties") or {}
+        polys = []
+        for feat in features:
+            geom_gj = feat.get("geometry")
+            if not geom_gj:
+                continue
+            try:
+                geom = g["shape"](geom_gj)
+                if not geom.is_valid:
+                    geom = g["make_valid"](geom)
+                if not geom.is_empty:
+                    polys.append(geom)
+            except Exception:  # noqa: BLE001
+                continue
+        if not polys:
             continue
         try:
-            fire_geom = g["shape"](geom_gj)
-            if not fire_geom.is_valid:
-                fire_geom = g["make_valid"](fire_geom)
-            if fire_geom.is_empty:
-                continue
+            fire_geom = g["unary_union"](polys) if len(polys) > 1 else polys[0]
         except Exception:  # noqa: BLE001
             continue
 
@@ -114,11 +142,19 @@ def main() -> None:
             continue
         fires_on_nps += 1
 
-        # Acres from NIFC's authoritative field; fall back to computed.
+        # Acres from NIFC's authoritative field; fall back to computed geometry
+        # area (EPSG:5070) when both NIFC fields are null. Prevents "severity=info"
+        # for an early-stage megafire that has geometry but no reported IncidentSize.
         try:
             fire_acres = float(p.get("poly_GISAcres") or p.get("attr_IncidentSize") or 0)
         except (TypeError, ValueError):
             fire_acres = 0.0
+        if fire_acres <= 0:
+            from common import area_acres
+            try:
+                fire_acres = area_acres(fire_geom)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             contained = float(p.get("attr_PercentContained") or 0)
         except (TypeError, ValueError):

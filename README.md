@@ -31,10 +31,15 @@ Every 15 min (weather alerts drive the freshness need; quakes/fires re-run cheap
 ## Design decisions
 
 - **Pipeline pre-intersects, not the browser.** PAD-US is ~655k polygons and can't live in a frontend. The mask + intersection stay server-side; the app fetches slim already-intersected results.
-- **Area in EPSG:5070** (CONUS Albers equal-area) — good enough for CONUS + acceptable elsewhere for our use.
-- **Quakes are buffered by mag-informed radii** (M<5→20km, M5-6→50km, M6-7→150km, M7+→300km). Coarse first-pass; refine in Phase 2 with ShakeMap MMI-VI polygons.
+- **Area in EPSG:5070** (NAD83 CONUS Albers Equal Area) — Albers is a conic equal-area projection, so area is preserved globally, including Alaska. Shape distortion outside the standard parallels does not affect `.area`.
+- **Quakes are buffered by mag-informed radii** (M<5→20km, M5-6→50km, M6-7→150km, M7+→300km). Coarse first-pass; refine in Phase 2 with ShakeMap MMI-VI polygons. Antimeridian-safe: Aleutian-region quakes produce a MultiPolygon split at ±180° so shapely doesn't wrap and spuriously intersect unrelated units.
+- **NIFC fires deduplicated by IRWIN_ID** — WFIGS commonly holds multiple polygons per fire during morphology updates; we union polys and keep the newest `poly_DateCurrent`.
 - **Fires read directly from NIFC** — not from any FIRESTORM data repo. Source-of-truth decoupling.
 - **NWS alerts with zone-code-only geometry are skipped** in Phase 1 (they have no inline polygon). Zone-code resolution against NWS zone layers is Phase 2.
+- **Per-hazard acres are unit-deduplicated.** If Red Flag + Fire Weather Watch both hit Sequoia, Sequoia counts once for the weather roll-up.
+- **`acres_at_risk` is a lower bound** (sum of max acres per unit across hazards). True value is the geometric union of fragments — a Phase-2 refinement. The lower bound never over-counts; consumers get honest arithmetic.
+- **Rollup guard.** If all three hazard feeds are missing/errored, the rollup refuses to publish `0`s (a false all-clear) and preserves the prior file with `status:"stale"`.
+- **Mask CDN cache-buster.** `?t=<epoch/900>` on the mask URL — 15-min-quantized so runs in the same window share cache but a fresh mask push is picked up within one cron cycle.
 
 ## Contract shape
 
