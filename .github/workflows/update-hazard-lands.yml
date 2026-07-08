@@ -1,0 +1,62 @@
+name: update-hazard-lands
+
+# Hazard × DOI-Lands intersections for PROMETHEUS. Reads the NPS mask from the
+# prometheus-doi-lands-data repo CDN. Cadence: 15 min (weather is the fastest
+# freshness need; quakes/fires re-run cheaply).
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-hazard-lands
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install geo deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install shapely pyproj
+
+      # Each hazard fetcher is independent; one failing feed must not block the
+      # others. build_rollup runs last, over whatever succeeded.
+      - name: Fetch hazards × NPS lands
+        working-directory: .
+        run: |
+          set +e
+          rc=0
+          for f in fetch_nws_alerts_x_lands fetch_usgs_quakes_x_lands fetch_fires_x_lands; do
+            echo "::group::$f"
+            python3 scripts/$f.py
+            if [ $? -ne 0 ]; then echo "::warning::$f failed"; rc=1; fi
+            echo "::endgroup::"
+            sleep 2
+          done
+          echo "::group::build_rollup"
+          python3 scripts/build_rollup.py || echo "::warning::rollup build failed"
+          echo "::endgroup::"
+          exit 0
+
+      - name: Commit changed feeds
+        run: |
+          git config user.name  "prometheus-hazard-lands-bot"
+          git config user.email "prometheus-hazard-lands-bot@users.noreply.github.com"
+          git add data/*.json data/*.geojson
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "hazard-lands: refresh $(date -u +%FT%TZ)"
+            git push
+          fi
