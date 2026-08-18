@@ -35,10 +35,10 @@ WHY WE PULL INSTEAD OF COMPUTING
     already computes the intersection with real ST_Contains, so we pull the ANSWER (a few
     hundred KB) rather than the INPUT (378 MB).
 
-    Direction is Prometheus-pulls, not EDIP-pushes, because EDIP's S3 bucket lives in
-    account 599128160527 and is not internet-readable (verified: anonymous GET -> 403), and
-    a cross-account bucket policy is denied by a Resource Control Policy -- it would need a
-    CHS ticket. A GHA cron here needs nothing from anyone.
+    Direction is Prometheus-pulls, not EDIP-pushes, because EDIP's S3 bucket lives in a
+    different AWS account and is not internet-readable (verified: anonymous GET -> 403), and
+    a cross-account bucket policy is denied by a Resource Control Policy -- no principal-side
+    change defeats an RCP, so it would need a ticket. A cron here needs nothing from anyone.
 
 THREE TRAPS THIS QUERY HANDLES (all verified live, all silent if you get them wrong)
     1. BIA land is coded 'TRIB' in PAD-US, never 'BIA'. Filtering on 'BIA' returns ZERO
@@ -68,11 +68,14 @@ Emits:
 """
 from __future__ import annotations
 
+import base64
+import datetime
 import json
 import os
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from common import DATA_DIR, fail, now_iso, write_json
@@ -128,14 +131,106 @@ def _require_config() -> None:
         fail("missing required env: " + ", ".join(missing)
              + ". These are deliberately not defaulted — this repo is public. "
              + "Locally: export them (see README). In CI: set repo secrets/vars.")
-    # EDIP_PROFILE is only needed on the CLI path; the token path ignores it.
-    if not (os.environ.get("DATABRICKS_HOST") and os.environ.get("DATABRICKS_TOKEN")) \
-            and not EDIP_PROFILE:
-        fail("no DATABRICKS_HOST+DATABRICKS_TOKEN and no EDIP_PROFILE — cannot authenticate. "
-             "Set the token pair (CI) or EDIP_PROFILE (local databricks CLI).")
+    # Authentication: any ONE of the four modes in query() must be fully configured.
+    has_arn = bool(os.environ.get("EDIP_OAUTH_SECRET_ARN"))
+    has_oauth = bool(os.environ.get("DATABRICKS_CLIENT_ID")
+                     and os.environ.get("DATABRICKS_CLIENT_SECRET")
+                     and os.environ.get("DATABRICKS_HOST"))
+    has_bearer = bool(os.environ.get("DATABRICKS_HOST")
+                      and os.environ.get("DATABRICKS_TOKEN"))
+    if not (has_arn or has_oauth or has_bearer or EDIP_PROFILE):
+        fail("no usable auth. Set ONE of: EDIP_OAUTH_SECRET_ARN (preferred); "
+             "DATABRICKS_CLIENT_ID+DATABRICKS_CLIENT_SECRET+DATABRICKS_HOST; "
+             "DATABRICKS_TOKEN+DATABRICKS_HOST; or EDIP_PROFILE for the local CLI.")
 
 
 # ---- warehouse access --------------------------------------------------------
+
+def _oauth_bearer(host: str, client_id: str, client_secret: str,
+                  token_endpoint: str = "") -> str:
+    """Exchange an OAuth M2M client-credentials pair for a short-lived bearer token.
+
+    ⚠️ A Databricks service-principal OAuth SECRET IS NOT A BEARER TOKEN. Sending it
+    straight to /api/2.0/sql/statements returns 401, which reads as "bad credential" and
+    sends you back to the admin who issued a perfectly good one. It must be exchanged at
+    the account token endpoint first, with HTTP Basic auth and scope=all-apis.
+    """
+    endpoint = token_endpoint or (host.rstrip("/") + "/oidc/v1/token")
+    # Verified against the workspace's own /oidc/.well-known/oauth-authorization-server
+    # 2026-08-18: token_endpoint is <host>/oidc/v1/token, client_credentials is supported,
+    # client_secret_basic (HTTP Basic) is an accepted auth method, and all-apis is a valid
+    # scope. Bad credentials return 401 invalid_client — an OAuth body, not a 404 — which
+    # confirms the path rather than merely the host being alive.
+    #
+    # ⚠️ SCOPE IS DELIBERATELY OVERRIDABLE AND DEFAULTS WIDE. all-apis grants everything the
+    # principal can do; this job only runs SELECT via the Statement API, and the workspace
+    # also advertises a narrower `sql` scope. all-apis is the default only because it is the
+    # documented, known-working value — narrowing it is untested here (no credential to try
+    # it with). Once the feed is live, set EDIP_OAUTH_SCOPE=sql and confirm the pull still
+    # succeeds; if it does, keep it narrow.
+    scope = os.environ.get("EDIP_OAUTH_SCOPE", "").strip() or "all-apis"
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "scope": scope,
+    }).encode()
+    req = urllib.request.Request(
+        endpoint, data=body, method="POST",
+        headers={"Authorization": f"Basic {basic}",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            d = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        fail(f"OAuth exchange HTTP {e.code} at {endpoint}: "
+             f"{e.read()[:300].decode(errors='replace')}")
+    except Exception as e:  # noqa: BLE001
+        fail(f"OAuth exchange failed at {endpoint}: {e}")
+    tok = (d or {}).get("access_token", "")
+    if not tok:
+        fail(f"OAuth exchange returned no access_token (keys: {sorted((d or {}).keys())})")
+    print(f"  auth: OAuth M2M exchange OK (expires_in={d.get('expires_in')}s)")
+    return tok
+
+
+def _from_secrets_manager(arn: str) -> dict:
+    """Read the credential blob from AWS Secrets Manager.
+
+    Preferred path: the secret never lands in a repo secret, a log or a transcript. Needs an
+    AWS identity in the account that OWNS the secret. Note that account may NOT be the one
+    a CI runner or a laptop is signed into — a cross-account read requires a resource policy
+    ON the secret, and its absence fails as AccessDenied naming no resource-based policy.
+    """
+    try:
+        import boto3  # noqa: PLC0415
+    except ImportError:
+        fail("EDIP_OAUTH_SECRET_ARN is set but boto3 is not installed.")
+    region = arn.split(":")[3] if arn.startswith("arn:") else "us-west-2"
+    try:
+        sm = boto3.client("secretsmanager", region_name=region)
+        raw = sm.get_secret_value(SecretId=arn)["SecretString"]
+    except Exception as e:  # noqa: BLE001
+        fail(f"could not read {arn}: {e}")
+    try:
+        blob = json.loads(raw)
+    except json.JSONDecodeError:
+        fail("secret is not JSON; expected client_id/client_secret/token_endpoint/...")
+    # Surface an approaching expiry rather than discovering it as a 401 at 3am. The secret
+    # has a fixed lifetime and nothing upstream monitors it.
+    try:
+        meta = sm.describe_secret(SecretId=arn)
+        for k in ("NextRotationDate", "ExpirationDate"):
+            if meta.get(k):
+                days = (meta[k] - datetime.datetime.now(datetime.timezone.utc)).days
+                if days <= 21:
+                    print(f"  ⚠️ CREDENTIAL EXPIRES IN {days} DAY(S) ({meta[k]:%Y-%m-%d}) "
+                          "— rotate before it lapses; this feed stops silently otherwise.")
+                break
+    except Exception:  # noqa: BLE001, S110
+        pass  # advisory only; never block the pull on a metadata read
+    return blob
+
 
 def _run_sql_via_token(host: str, token: str, statement: str) -> dict:
     body = json.dumps({
@@ -183,11 +278,39 @@ def _run_sql_via_cli(statement: str) -> dict:
 
 
 def query(statement: str) -> list[dict]:
-    """Run read-only SQL and return a list of dicts. Fails loud on anything unexpected."""
+    """Run read-only SQL and return a list of dicts. Fails loud on anything unexpected.
+
+    Four auth modes, in preference order. The first that is fully configured wins.
+      1. EDIP_OAUTH_SECRET_ARN  — read client_id/secret from AWS Secrets Manager, exchange.
+                                  Best: the credential never enters a repo secret or a log.
+                                  Requires an AWS identity in the secret's OWNING account.
+      2. DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET — exchange, then Bearer.
+                                  Use when CI has no AWS identity in that account.
+      3. DATABRICKS_TOKEN       — already-a-bearer (PAT, or a token exchanged elsewhere).
+      4. databricks CLI profile — local operator convenience, no secret handling at all.
+    """
     host = os.environ.get("DATABRICKS_HOST", "").strip()
     token = os.environ.get("DATABRICKS_TOKEN", "").strip()
-    if host and token:
-        print("  auth: DATABRICKS_TOKEN (service principal)")
+    cid = os.environ.get("DATABRICKS_CLIENT_ID", "").strip()
+    csec = os.environ.get("DATABRICKS_CLIENT_SECRET", "").strip()
+    arn = os.environ.get("EDIP_OAUTH_SECRET_ARN", "").strip()
+    endpoint = ""
+
+    if arn:
+        blob = _from_secrets_manager(arn)
+        cid = cid or blob.get("client_id", "")
+        csec = csec or blob.get("client_secret", "")
+        endpoint = blob.get("token_endpoint", "")
+        host = host or blob.get("workspace_host", "")
+        print("  auth: credential from Secrets Manager")
+
+    if cid and csec:
+        if not host:
+            fail("OAuth client credentials present but no workspace host "
+                 "(set DATABRICKS_HOST, or workspace_host in the secret blob).")
+        d = _run_sql_via_token(host, _oauth_bearer(host, cid, csec, endpoint), statement)
+    elif host and token:
+        print("  auth: DATABRICKS_TOKEN (pre-exchanged bearer)")
         d = _run_sql_via_token(host, token, statement)
     else:
         print(f"  auth: databricks CLI, profile={EDIP_PROFILE}")

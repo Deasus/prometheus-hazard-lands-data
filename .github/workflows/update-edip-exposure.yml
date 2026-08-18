@@ -17,14 +17,28 @@ name: update-edip-exposure
 # ids is free reconnaissance against a DOI Databricks workspace. They live in repo
 # secrets/vars, which is why there are no defaults below.
 #
-# NEEDS THREE REPO SECRETS + ONE VAR. Until they exist this workflow SKIPS cleanly rather
-# than failing, so it can be merged before the credential is minted:
-#   secret DATABRICKS_HOST    the workspace URL
-#   secret DATABRICKS_TOKEN   a SERVICE PRINCIPAL credential — never a personal PAT.
-#                             A personal token carries a human's full workspace privileges
-#                             and dies when that account is disabled.
-#   secret EDIP_CATALOG       the Unity Catalog name holding gold.exposure
-#   var    EDIP_WAREHOUSE     the SQL warehouse id
+# ⚠️ THE CREDENTIAL IS OAuth M2M, NOT A BEARER TOKEN. The service principal's OAuth secret
+# cannot be sent to /api/2.0/sql/statements directly — it returns 401, which reads as "bad
+# credential" and sends you back to whoever issued a perfectly good one. It must be exchanged
+# for a short-lived token at <host>/oidc/v1/token first (HTTP Basic, grant_type=
+# client_credentials). pull_edip_exposure.py does that; do not "simplify" it away.
+#
+# NEEDS FOUR SECRETS + ONE VAR. Until they exist this workflow SKIPS cleanly rather than
+# failing, so it can be merged before the credential is wired:
+#   secret DATABRICKS_HOST            the workspace URL
+#   secret DATABRICKS_CLIENT_ID       the service principal's client id (not a human's)
+#   secret DATABRICKS_CLIENT_SECRET   its OAuth secret. Has a FIXED LIFETIME — when it
+#                                     lapses this feed stops and nothing else notices.
+#   secret EDIP_CATALOG               the Unity Catalog name holding gold.exposure
+#   var    EDIP_WAREHOUSE             the SQL warehouse id
+#
+# The credential's canonical home is AWS Secrets Manager in the account that owns the
+# Databricks workspace. Copying it into repo secrets duplicates it, which is a real cost.
+# The alternative — EDIP_OAUTH_SECRET_ARN, read directly, no copy — needs this runner to hold
+# an AWS identity in THAT account (GitHub OIDC → an IAM role there, plus a resource policy on
+# the secret). Verified 2026-08-18 that a principal in a different account gets AccessDenied
+# citing no resource-based policy, so the ARN path does NOT work until that role exists.
+# Prefer the ARN path once it does; the script supports both with no change here.
 #
 # The service principal needs only three read-only grants — USE CATALOG on the catalog,
 # USE SCHEMA on its gold schema, SELECT on the single exposure table — plus CAN USE on the
@@ -65,17 +79,22 @@ jobs:
       - name: Pull DOI 5-bureau exposure from EDIP Gold
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
           EDIP_CATALOG: ${{ secrets.EDIP_CATALOG }}
           EDIP_WAREHOUSE: ${{ vars.EDIP_WAREHOUSE }}
+          # Set to 'sql' once verified live — narrower than all-apis. See the script.
+          EDIP_OAUTH_SCOPE: ${{ vars.EDIP_OAUTH_SCOPE }}
         run: |
           set -euo pipefail
-          if [ -z "${DATABRICKS_HOST}" ] || [ -z "${DATABRICKS_TOKEN}" ] \
-             || [ -z "${EDIP_CATALOG}" ] || [ -z "${EDIP_WAREHOUSE}" ]; then
-            echo "::notice::DATABRICKS_HOST/DATABRICKS_TOKEN not set — skipping."
-            echo "::notice::Create a Databricks service principal + token, add both as repo"
-            echo "::notice::secrets, then re-run. Until then data/doi-exposure-5bureau.json"
-            echo "::notice::keeps whatever was last committed and is NOT silently zeroed."
+          if [ -z "${DATABRICKS_HOST}" ] || [ -z "${DATABRICKS_CLIENT_ID}" ] \
+             || [ -z "${DATABRICKS_CLIENT_SECRET}" ] || [ -z "${EDIP_CATALOG}" ] \
+             || [ -z "${EDIP_WAREHOUSE}" ]; then
+            echo "::notice::OAuth credential/config not set — skipping, not failing."
+            echo "::notice::Needs DATABRICKS_HOST, DATABRICKS_CLIENT_ID,"
+            echo "::notice::DATABRICKS_CLIENT_SECRET, EDIP_CATALOG (secrets) +"
+            echo "::notice::EDIP_WAREHOUSE (var). data/doi-exposure-5bureau.json keeps"
+            echo "::notice::whatever was last committed and is NOT silently zeroed."
             exit 0
           fi
           python3 scripts/pull_edip_exposure.py
