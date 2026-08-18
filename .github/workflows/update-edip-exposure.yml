@@ -1,0 +1,113 @@
+name: update-edip-exposure
+
+# DOI-wide (5-bureau) fire exposure, PULLED from EDIP Gold.
+#
+# ⚠️ DELIBERATELY SEPARATE FROM update-hazard-lands.yml. Four reasons:
+#   1. Different cadence. The upstream gold.exposure table is rebuilt by EDIP's own
+#      scheduled job, not every 15 minutes. Pulling at the hazard loop's cadence would
+#      re-query the same built_at over and over.
+#   2. Credential isolation. This is the only workflow in the repo that holds a secret.
+#   3. Blast radius. A Databricks outage, an expired token or a paused warehouse must not
+#      turn the 15-minute hazard loop red — those feeds are keyless and independent.
+#   4. Warehouse cost. Each run may wake a serverless SQL warehouse.
+#
+# ⚠️ THIS REPO IS PUBLIC. Do not paste the workspace hostname, warehouse id or catalog
+# name into this file — not even as an example in a comment. None of them is a credential
+# and gitleaks will not flag them, but a named workspace endpoint plus internal resource
+# ids is free reconnaissance against a DOI Databricks workspace. They live in repo
+# secrets/vars, which is why there are no defaults below.
+#
+# NEEDS THREE REPO SECRETS + ONE VAR. Until they exist this workflow SKIPS cleanly rather
+# than failing, so it can be merged before the credential is minted:
+#   secret DATABRICKS_HOST    the workspace URL
+#   secret DATABRICKS_TOKEN   a SERVICE PRINCIPAL credential — never a personal PAT.
+#                             A personal token carries a human's full workspace privileges
+#                             and dies when that account is disabled.
+#   secret EDIP_CATALOG       the Unity Catalog name holding gold.exposure
+#   var    EDIP_WAREHOUSE     the SQL warehouse id
+#
+# The service principal needs only three read-only grants — USE CATALOG on the catalog,
+# USE SCHEMA on its gold schema, SELECT on the single exposure table — plus CAN USE on the
+# warehouse. Deliberately NOT the catalog-wide reader group: that inherits to bronze,
+# silver and ops, and ops holds the platform's irreplaceable run log and its own
+# self-assessment prose. An automated consumer feeding another system has no business there.
+# Grant to a GROUP, not the principal directly — per EDIP's own governance note, five
+# groups once had zero members and every grant silently applied to nobody. Verify with a
+# direct `groups get`: `groups list` omits the members field, so everything reads as empty.
+
+on:
+  schedule:
+    - cron: '25 * * * *'   # hourly at :25, offset off the top of the hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-edip-exposure
+  cancel-in-progress: false
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # No pip install. pull_edip_exposure.py is stdlib-only — verified by importing it
+      # with shapely and pyproj blocked. Do not add geo deps here; if this script ever
+      # needs them, it has stopped being a pull and started being a computation, which
+      # belongs in EDIP instead.
+
+      - name: Pull DOI 5-bureau exposure from EDIP Gold
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          EDIP_CATALOG: ${{ secrets.EDIP_CATALOG }}
+          EDIP_WAREHOUSE: ${{ vars.EDIP_WAREHOUSE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DATABRICKS_HOST}" ] || [ -z "${DATABRICKS_TOKEN}" ] \
+             || [ -z "${EDIP_CATALOG}" ] || [ -z "${EDIP_WAREHOUSE}" ]; then
+            echo "::notice::DATABRICKS_HOST/DATABRICKS_TOKEN not set — skipping."
+            echo "::notice::Create a Databricks service principal + token, add both as repo"
+            echo "::notice::secrets, then re-run. Until then data/doi-exposure-5bureau.json"
+            echo "::notice::keeps whatever was last committed and is NOT silently zeroed."
+            exit 0
+          fi
+          python3 scripts/pull_edip_exposure.py
+
+      # The script itself refuses to publish a zero-unit or single-bureau result, so a
+      # committed change here has already passed those guards. This is a second, cheap
+      # check that the artifact on disk is what we think it is before it reaches the CDN.
+      - name: Sanity-check the artifact before committing
+        run: |
+          set -euo pipefail
+          f=data/doi-exposure-5bureau.json
+          if [ ! -f "$f" ]; then echo "::notice::no artifact (skipped) — nothing to check"; exit 0; fi
+          python3 - "$f" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          ex = d.get("exec") or {}
+          nb = ex.get("bureaus_covered", 0)
+          nu = ex.get("units_exposed", 0)
+          assert d.get("domain") == "doiLands", f"wrong domain: {d.get('domain')}"
+          assert nb >= 2, f"only {nb} bureau(s) — the NPS-only regression this feed exists to fix"
+          assert nu > 0, "zero units exposed"
+          print(f"OK: {nu} units across {nb} bureaus, {ex.get('detections')} detections")
+          PY
+
+      - name: Commit changed feed
+        run: |
+          git config user.name  "prometheus-hazard-lands-bot"
+          git config user.email "prometheus-hazard-lands-bot@users.noreply.github.com"
+          git add data/doi-exposure-5bureau.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "edip-exposure: refresh $(date -u +%FT%TZ)"
+            git push
+          fi
